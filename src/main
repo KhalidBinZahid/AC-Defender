@@ -1,0 +1,388 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <EEPROM.h>
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// Pin Definitions
+const int pinV = A0;
+const int pinI = A1;
+const int relayPin = 7;
+const int btnMenu = 8;
+const int btnUp = 9;
+const int btnDown = 10;
+
+// System Variables
+float V_RMS = 0.0;
+float I_RMS = 0.0;
+
+bool relayState = true;
+unsigned long recoveryTimer = 0;
+bool systemLocked = false; // Added to permanently lock the system on Over-Current
+
+// Fault Tracking
+enum FaultType { NONE, OVER_VOLT, UNDER_VOLT, OVER_CURR, UNDER_CURR };
+FaultType activeFault = NONE;
+
+// Calibration Multipliers for Proteus Simulation to compensate any obtained value to match real value
+const float V_CAL = 0.814; 
+const float I_CAL = 0.035;
+
+// EEPROM Configuration for permanent storing variable value
+struct Config {
+  int magicNumber; 
+  int vLow;
+  int vHigh;
+  float iLow;
+  float iHigh;
+} config;
+
+// UI State Machine
+enum UIState { HOME, MAIN_MENU, VOLT_MENU, CURR_MENU, EDIT_VAL };
+UIState currentState = HOME;
+int cursorIndex = 0;
+int editingTarget = 0; // 1: LowV, 2: HighV, 3: LowI, 4: HighI
+
+// Timing  Variables
+unsigned long lastDisplayUpdate = 0;
+unsigned long lastButtonPress = 0;
+bool displayNeedsUpdate = true;
+
+// Long Press Logic Variables
+bool lastMenu = HIGH, lastUp = HIGH, lastDown = HIGH;
+unsigned long menuPressTime = 0;
+bool isMenuPressed = false;
+const int LONG_PRESS_TIME = 800; // 800 milliseconds to trigger a "Long Press"
+
+void setup() {
+  Serial.begin(9600);
+  
+  pinMode(relayPin, OUTPUT);
+  pinMode(btnMenu, INPUT_PULLUP);
+  pinMode(btnUp, INPUT_PULLUP);
+  pinMode(btnDown, INPUT_PULLUP);
+
+  // Load configuration from EEPROM & Format EEPROM on first boot
+  EEPROM.get(0, config);
+  if (config.magicNumber != 12345) {
+    config.magicNumber = 12345;
+    config.vLow = 170;
+    config.vHigh = 250;
+    config.iLow = 0.0;
+    config.iHigh = 10.0;
+    EEPROM.put(0, config);
+    Serial.println(F("EEPROM Formatted."));
+  }
+
+  // Initialize OLED & Halt if OLED fails
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println(F("Display failed"));
+    for(;;);
+  }
+  display.clearDisplay();
+  display.setTextColor(WHITE);
+  display.setTextSize(1);
+  
+  Serial.println(F("System Ready. Type GET_DATA to view status."));
+}
+
+void loop() {
+  measureRMS();
+  if (!systemLocked) {
+    checkProtection();
+  }
+  handleButtons();
+  handleSerialCommands();
+  
+  // Refresh display every 200ms or instantly if a button is pressed
+  if (millis() - lastDisplayUpdate > 200 || displayNeedsUpdate) {
+    updateDisplay();
+    lastDisplayUpdate = millis();
+    displayNeedsUpdate = false;
+  }
+}
+
+// RMS Measurement & Protection
+void measureRMS() {
+  unsigned long startMillis = millis();
+  long sumV = 0, sumI = 0;
+  int count = 0;
+
+  // 20ms sample window (One 50Hz cycle)
+  while (millis() - startMillis < 20) {
+    int rawV = analogRead(pinV) - 512; // Remove 2.5V DC offset from the circuit
+    int rawI = analogRead(pinI) - 512;
+    sumV += ((long)rawV * rawV);
+    sumI += ((long)rawI * rawI);
+    count++;
+  }
+
+  if (count > 0) {
+    V_RMS = sqrt((float)sumV / count) * V_CAL;
+    I_RMS = sqrt((float)sumI / count) * I_CAL;
+  }
+}
+
+void checkProtection() {
+  bool tripRelay = false;
+  bool warningOnly = false;
+  FaultType currentIssue = NONE;
+
+  // 1. OVER-CURRENT: Permanent Lockout Trip
+  if (I_RMS > config.iHigh) { 
+    tripRelay = true; 
+    currentIssue = OVER_CURR; 
+    systemLocked = true; // Permanently freezes relay OFF until reset
+  }
+  // 2. VOLTAGE FAULTS: 10-Second Auto-Recovery Trips
+  else if (V_RMS > config.vHigh) { tripRelay = true; currentIssue = OVER_VOLT; }
+  else if (V_RMS < config.vLow) { tripRelay = true; currentIssue = UNDER_VOLT; }
+  // 3. UNDER-CURRENT: Warning Only (Relay stays ON)
+  else if (relayState == true && I_RMS < config.iLow) { 
+    warningOnly = true; 
+    currentIssue = UNDER_CURR; 
+  }
+
+  if (tripRelay) {
+    digitalWrite(relayPin, LOW); // Disconnect load instantly
+    relayState = false;
+    recoveryTimer = millis();    
+    activeFault = currentIssue;  
+  } 
+  else if (warningOnly) {
+    digitalWrite(relayPin, HIGH); // Keep relay ON
+    relayState = true;
+    activeFault = currentIssue;   // Display warning
+  } 
+  else {
+    if (!relayState) {
+      if (millis() - recoveryTimer >= 10000) {
+        digitalWrite(relayPin, HIGH); 
+        relayState = true;
+        activeFault = NONE;
+        displayNeedsUpdate = true;    
+      }
+    } else {
+      if (activeFault == UNDER_CURR) {
+        activeFault = NONE; // Clear warning when normal
+        displayNeedsUpdate = true;
+      }
+      digitalWrite(relayPin, HIGH); 
+    }
+  }
+}
+
+// PC Terminal Logic
+void handleSerialCommands() {
+  if (Serial.available() > 0) {
+    String cmd = Serial.readStringUntil('\n');
+    cmd.trim();
+    cmd.toUpperCase();
+
+    if (cmd == "GET_DATA") {
+      Serial.print(F("V_RMS: ")); Serial.print(V_RMS);
+      Serial.print(F("V | I_RMS: ")); Serial.print(I_RMS);
+      Serial.print(F("A | RELAY: ")); Serial.println(relayState ? F("ON") : F("OFF"));
+    } 
+    else if (cmd.startsWith("SET_OV=")) {
+      config.vHigh = cmd.substring(7).toInt();
+      EEPROM.put(0, config);
+      Serial.print(F("High Voltage set to: ")); Serial.println(config.vHigh);
+    }
+    else if (cmd.startsWith("SET_UV=")) {
+      config.vLow = cmd.substring(7).toInt();
+      EEPROM.put(0, config);
+      Serial.print(F("Low Voltage set to: ")); Serial.println(config.vLow);
+    }
+    else if (cmd.startsWith("SET_OC=")) {
+      config.iHigh = cmd.substring(7).toFloat();
+      EEPROM.put(0, config);
+      Serial.print(F("High Current set to: ")); Serial.println(config.iHigh);
+    }
+    else if (cmd.startsWith("SET_UC=")) {
+      config.iLow = cmd.substring(7).toFloat();
+      EEPROM.put(0, config);
+      Serial.print(F("Low Current set to: ")); Serial.println(config.iLow);
+    }
+    else {
+      Serial.println(F("Unknown Cmd. Use GET_DATA, SET_OV=, SET_UV=, SET_OC=, SET_UC="));
+    }
+  }
+}
+
+// Button Control Logic
+void handleButtons() {
+  bool currentMenu = digitalRead(btnMenu);
+  bool currentUp = digitalRead(btnUp);
+  bool currentDown = digitalRead(btnDown);
+  unsigned long now = millis();
+
+  // MENU BUTTON LOGIC (Handles Short vs Long Press upon Release)
+  if (lastMenu == HIGH && currentMenu == LOW) {
+    menuPressTime = now;
+    isMenuPressed = true;
+  }
+  
+  if (lastMenu == LOW && currentMenu == HIGH && isMenuPressed) {
+    isMenuPressed = false;
+    unsigned long pressDuration = now - menuPressTime;
+    
+    if (pressDuration > 50) { // Basic debounce
+      displayNeedsUpdate = true;
+      
+      if (pressDuration >= LONG_PRESS_TIME) { 
+        // LONG PRESS
+        if (currentState == EDIT_VAL) {
+          EEPROM.put(0, config); // Save value permanently
+          currentState = HOME;   // Return to home
+        }
+      } 
+      else { 
+        // SHORT PRESS
+        switch (currentState) {
+          case HOME:
+            currentState = MAIN_MENU; cursorIndex = 0; break;
+          case MAIN_MENU:
+            if (cursorIndex == 0) { currentState = VOLT_MENU; cursorIndex = 0; }
+            else if (cursorIndex == 1) { currentState = CURR_MENU; cursorIndex = 0; }
+            else if (cursorIndex == 2) { currentState = HOME; } 
+            break;
+          case VOLT_MENU:
+            if (cursorIndex == 0) { currentState = EDIT_VAL; editingTarget = 1; }
+            else if (cursorIndex == 1) { currentState = EDIT_VAL; editingTarget = 2; }
+            else if (cursorIndex == 2) { currentState = MAIN_MENU; cursorIndex = 0; } 
+            break;
+          case CURR_MENU:
+            if (cursorIndex == 0) { currentState = EDIT_VAL; editingTarget = 3; }
+            else if (cursorIndex == 1) { currentState = EDIT_VAL; editingTarget = 4; }
+            else if (cursorIndex == 2) { currentState = MAIN_MENU; cursorIndex = 1; } 
+            break;
+          case EDIT_VAL:
+            // Short press means CANCEL/BACK. Fetch old value from EEPROM to undo RAM changes.
+            EEPROM.get(0, config); 
+            if (editingTarget == 1 || editingTarget == 2) { 
+              currentState = VOLT_MENU; 
+              cursorIndex = editingTarget - 1; 
+            } else { 
+              currentState = CURR_MENU; 
+              cursorIndex = editingTarget - 3; 
+            }
+            break;
+        }
+      }
+    }
+  }
+  lastMenu = currentMenu;
+
+  // UP BUTTON LOGIC
+  if (lastUp == HIGH && currentUp == LOW && (now - lastButtonPress > 150)) {
+    lastButtonPress = now;
+    displayNeedsUpdate = true;
+    
+    if (currentState == EDIT_VAL) {
+      if (editingTarget == 1) config.vLow++;
+      if (editingTarget == 2) config.vHigh++;
+      if (editingTarget == 3) config.iLow += 0.5;
+      if (editingTarget == 4) config.iHigh += 0.5;
+    } else if (currentState != HOME) {
+      cursorIndex--;
+      if (cursorIndex < 0) cursorIndex = 2;
+    }
+  }
+  lastUp = currentUp;
+
+  // DOWN BUTTON LOGIC
+  if (lastDown == HIGH && currentDown == LOW && (now - lastButtonPress > 150)) {
+    lastButtonPress = now;
+    displayNeedsUpdate = true;
+    
+    if (currentState == EDIT_VAL) {
+      if (editingTarget == 1) config.vLow--;
+      if (editingTarget == 2) config.vHigh--;
+      if (editingTarget == 3) config.iLow -= 0.5;
+      if (editingTarget == 4) config.iHigh -= 0.5;
+    } else if (currentState != HOME) {
+      cursorIndex++;
+      if (cursorIndex > 2) cursorIndex = 0;
+    }
+  }
+  lastDown = currentDown;
+}
+
+// OLED Rendering
+void updateDisplay() {
+  display.clearDisplay();
+  display.setCursor(0, 0);
+
+  if (currentState == HOME) {
+    display.setTextSize(1);
+    display.println(F("    AC DEFENDER    "));
+    display.println("-------------------");
+    display.println("");
+
+    display.print(F("   Voltage: ")); display.print(V_RMS, 0); display.println(F("V"));
+    display.print(F("   Current: ")); display.print(I_RMS, 1); display.println(F("A"));
+
+    display.println("");
+    display.print(F("STATUS: "));
+   
+  if(relayState) {
+      if (activeFault == UNDER_CURR) display.print(F("UNDER CURRENT - SYSTEM ON"));
+      else display.print(F("NORMAL"));
+    } else {// Print the specific error that triggered the fault
+      if (activeFault == OVER_VOLT) display.print(F("OVER VOLTAGE - SYSTEM OFF"));
+      else if (activeFault == UNDER_VOLT) display.print(F("UNDER VOLTAGE - SYSTEM OFF"));
+      else if (activeFault == OVER_CURR) display.print(F("OVER CURRENT - ATTENTION NEEDED"));
+      else display.print(F("FAULT TRIPPED!")); 
+    }
+  } 
+  
+  else if (currentState == MAIN_MENU) {
+    display.setTextSize(1);
+    display.println(F("     MAIN MENU"));
+    display.println(F("---------------------"));
+    display.println(cursorIndex == 0 ? F("> 1. Volt Threshold") : F("  1. Volt Threshold"));
+    display.println(cursorIndex == 1 ? F("> 2. Curr Threshold") : F("  2. Curr Threshold"));
+    display.println(cursorIndex == 2 ? F("> 3. Back") : F("  3. Back"));
+  }
+  
+  else if (currentState == VOLT_MENU) {
+    display.setTextSize(1);
+    display.println(F("   VOLT THRESHOLD"));
+    display.println(F("---------------------"));
+    display.println(cursorIndex == 0 ? F("> 1. Low Voltage") : F("  1. Low Voltage"));
+    display.println(cursorIndex == 1 ? F("> 2. High Voltage") : F("  2. High Voltage"));
+    display.println(cursorIndex == 2 ? F("> 3. Back") : F("  3. Back"));
+  }
+  
+  else if (currentState == CURR_MENU) {
+    display.setTextSize(1);
+    display.println(F("CURRENT THRESHOLD"));
+    display.println(F("---------------------"));
+    display.println(cursorIndex == 0 ? F("> 1. Low Current") : F("  1. Low Current"));
+    display.println(cursorIndex == 1 ? F("> 2. High Current") : F("  2. High Current"));
+    display.println(cursorIndex == 2 ? F("> 3. Back") : F("  3. Back"));
+  }
+  
+  else if (currentState == EDIT_VAL) {
+    display.setTextSize(1);
+    display.println(F("     ADJUST VALUE"));
+    display.println(F("---------------------"));
+    display.println(F("UP/DN to change"));
+    display.println(F("HOLD MENU: Save"));
+    display.println(F("SHORT MENU: Back"));
+    
+    display.setTextSize(2);
+    display.setCursor(0, 48); // Push text to the bottom to make room for instructions
+    if (editingTarget == 1) { display.print(F("Min: ")); display.print(config.vLow); display.print(F("V")); }
+    if (editingTarget == 2) { display.print(F("Max: ")); display.print(config.vHigh); display.print(F("V")); }
+    if (editingTarget == 3) { display.print(F("Min: ")); display.print(config.iLow, 1); display.print(F("A")); }
+    if (editingTarget == 4) { display.print(F("Max: ")); display.print(config.iHigh, 1); display.print(F("A")); }
+  }
+
+  display.display();
+}
